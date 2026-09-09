@@ -1,0 +1,29 @@
+# Model weights — too large for git, share separately (Drive, Roboflow link, etc.)
+*.pt
+*.onnx
+*.engine
+
+# Training runs and datasets — large, regenerable from Roboflow
+msmartflow_runs/
+datasets/
+
+# Generated output logs — not source code
+*.jsonl
+zone_events.jsonl
+
+# Secrets — never commit API keys
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# OS/editor junk
+.DS_Store
+.vscode/
+.idea/

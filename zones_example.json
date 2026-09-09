@@ -1,0 +1,14 @@
+{
+  "zones": [
+    {
+      "zone_id": "floor2_zoneA",
+      "polygon": [[50, 80], [400, 80], [400, 400], [50, 400]],
+      "capacity": 20
+    },
+    {
+      "zone_id": "floor2_exit",
+      "polygon": [[420, 80], [760, 80], [760, 400], [420, 400]],
+      "capacity": 10
+    }
+  ]
+}
