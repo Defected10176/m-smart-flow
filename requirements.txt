@@ -1,0 +1,9 @@
+# M-Smart Flow — Python dependencies
+# Install with: pip install -r requirements.txt
+
+ultralytics          # YOLO26 — local detection (vehicle_detection.py) and training (train_yolo_parking.py)
+opencv-python         # Video/webcam handling, drawing overlays
+numpy                 # Zone polygon math
+roboflow               # Dataset download for train_yolo_parking.py
+inference-sdk[webrtc]  # Roboflow hosted inference + video streaming (vehicle_detection_api.py, vehicle_detection_stream.py)
+supervision            # Detection annotation for vehicle_detection_stream.py
