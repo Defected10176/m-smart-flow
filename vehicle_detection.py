@@ -130,6 +130,8 @@ def main():
     parser.add_argument("--conf", type=float, default=0.4, help="Detection confidence threshold")
     parser.add_argument("--events-out", default="zone_events.jsonl", help="Path to write JSONL occupancy events")
     parser.add_argument("--no-display", action="store_true", help="Run headless (no video window)")
+    parser.add_argument("--start-seconds", type=float, default=0,
+                         help="Skip ahead this many seconds before starting playback/detection")
     args = parser.parse_args()
 
     model = YOLO(args.model)  # auto-downloads weights on first run
@@ -139,6 +141,15 @@ def main():
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video source: {args.source}")
+
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    duration_sec = total_frames / fps if fps else 0
+    print(f"[info] Video duration: ~{duration_sec:.1f} seconds ({int(total_frames)} frames at {fps:.1f} fps)")
+
+    if args.start_seconds > 0:
+        cap.set(cv2.CAP_PROP_POS_MSEC, args.start_seconds * 1000)
+        print(f"[info] Skipped ahead to {args.start_seconds} seconds")
 
     events_file = open(args.events_out, "a")
 
@@ -161,6 +172,13 @@ def main():
 
             if not args.no_display:
                 frame = draw_overlay(frame, detections, zones, snapshots)
+
+                max_display_width = 700
+                if frame.shape[1] > max_display_width:
+                    scale = max_display_width / frame.shape[1]
+                    frame = cv2.resize(frame, None, fx=scale, fy=scale)
+
+                cv2.namedWindow("M-Smart Flow — Vehicle Detection", cv2.WINDOW_NORMAL)
                 cv2.imshow("M-Smart Flow — Vehicle Detection", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
