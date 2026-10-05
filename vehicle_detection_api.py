@@ -1,5 +1,5 @@
 """
-M-Smart Flow — Vehicle Detection & Zone Occupancy (run_workflow version)
+M-Smart Flow - Vehicle Detection & Zone Occupancy (run_workflow version)
 ==========================================================================
 Uses client.run_workflow() — a simple, synchronous HTTP call per frame,
 using the exact workspace_name + workflow_id Roboflow generated for this
@@ -64,13 +64,13 @@ def extract_predictions(result):
     return []
 
 
-def detect_vehicles(client, frame, conf_threshold: float = 0.05):
+def detect_vehicles(client, frame, conf_threshold: float = 0.05, model_id: str = MODEL_ID):
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         tmp_path = tmp.name
     cv2.imwrite(tmp_path, frame)
 
     try:
-        result = client.infer(tmp_path, model_id=MODEL_ID)
+        result = client.infer(tmp_path, model_id=model_id)
     finally:
         os.remove(tmp_path)
 
@@ -101,16 +101,17 @@ detect_vehicles._debug_printed = False
 
 
 def compute_zone_crop_box(zone, frame_shape,
-                           pad_top_ratio=2.0, pad_bottom_ratio=0.6,
-                           pad_side_ratio=0.25, min_pad_px=80):
+                           pad_top_ratio=0.25, pad_bottom_ratio=0.15,
+                           pad_side_ratio=0.1, min_pad_px=60):
     """
     The model performs much better on a tight crop around a single row of
     cars than on the full wide-angle frame (confirmed via direct testing:
     full-frame confidences topped out ~0.56 with almost nothing else
     detected, while cropped-to-zone confidences reliably found multiple
-    cars at once). Zone polygons are traced near the floor/car-base, so we
-    pad generously upward to include car roofs, modestly downward/sideways
-    for context, and clamp to the frame bounds.
+    cars at once). Zones are expected to be drawn around the WHOLE cars in a
+    row (floor to roof), so we only add a small margin on each side. Large
+    padding on a tall zone would make the crop nearly the whole frame and
+    lose the zoom benefit. Result is clamped to the frame bounds.
     """
     xs = [p[0] for p in zone.polygon]
     ys = [p[1] for p in zone.polygon]
@@ -130,17 +131,81 @@ def compute_zone_crop_box(zone, frame_shape,
     return cx1, cy1, cx2, cy2
 
 
-def detect_vehicles_in_zone(client, frame, zone, conf_threshold):
+COCO_VEHICLE_CLASSES = {"car", "truck", "bus"}
+# Mutable so the worker thread can switch the helper model off after a failure.
+car_model_state = {"enabled": False, "model_id": None, "warned": False}
+
+
+def box_iou(a, b):
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter == 0:
+        return 0.0
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / float(area_a + area_b - inter)
+
+
+def point_in_box(pt, box):
+    return box[0] <= pt[0] <= box[2] and box[1] <= pt[1] <= box[3]
+
+
+def detect_vehicles_in_zone(client, frame, zone, args):
     """Crop to this zone's region (with padding), run detection on just the
     crop, then offset the returned boxes/centers back into full-frame
     coordinates so overlay drawing and zone point-in-polygon tests keep
-    working unchanged."""
+    working unchanged.
+
+    Two improvements over a single-model call:
+      1. Separate confidence cutoffs: 'free' needs a higher confidence than
+         'car', because on our footage the custom model often mislabels cars
+         as 'free' at low confidence.
+      2. Optional helper model (a standard COCO detector, also on Roboflow's
+         cloud) that is much better at spotting cars from any angle. A car it
+         finds is added as 'car', and any 'free' box whose center lies on a
+         detected car is dropped (a car there means the spot is occupied).
+    """
     cx1, cy1, cx2, cy2 = compute_zone_crop_box(zone, frame.shape)
     crop = frame[cy1:cy2, cx1:cx2]
     if crop.size == 0:
         return []
 
-    detections = detect_vehicles(client, crop, conf_threshold)
+    # Query the custom model at the lower of the two cutoffs, then filter per class.
+    raw = detect_vehicles(client, crop, min(args.conf, args.free_conf))
+    detections = [
+        d for d in raw
+        if (d["class"] == "free" and d["confidence"] >= args.free_conf)
+        or (d["class"] != "free" and d["confidence"] >= args.conf)
+    ]
+
+    if car_model_state["enabled"]:
+        try:
+            coco = detect_vehicles(client, crop, args.car_conf, model_id=car_model_state["model_id"])
+            coco_cars = [d for d in coco if d["class"] in COCO_VEHICLE_CLASSES]
+            for d in coco_cars:
+                d["class"] = "car"
+            # drop 'free' boxes sitting on a detected car
+            detections = [
+                d for d in detections
+                if not (d["class"] == "free" and any(point_in_box(d["center"], c["box"]) for c in coco_cars))
+            ]
+            # merge: skip a helper car if the custom model already has the same car
+            for c in coco_cars:
+                dup = next((d for d in detections
+                            if d["class"] != "free" and box_iou(d["box"], c["box"]) > 0.4), None)
+                if dup is None:
+                    detections.append(c)
+                elif c["confidence"] > dup["confidence"]:
+                    dup["confidence"] = c["confidence"]
+        except Exception as e:
+            if not car_model_state["warned"]:
+                print(f"[WARN] helper car model '{car_model_state['model_id']}' failed "
+                      f"({type(e).__name__}: {e}). Continuing with the custom model only.")
+                car_model_state["warned"] = True
+            car_model_state["enabled"] = False
+
     for det in detections:
         det["box"][0] += cx1
         det["box"][1] += cy1
@@ -229,6 +294,11 @@ def main():
     parser.add_argument("--zones", default="zones_example.json")
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--conf", type=float, default=0.05, help="Confidence threshold, 0-1 (this model needs a low value on real footage, e.g. 0.05)")
+    parser.add_argument("--free-conf", type=float, default=0.35,
+                         help="Higher confidence cutoff for 'free' detections (the model often mislabels cars as free at low confidence)")
+    parser.add_argument("--car-model", default="yolov8n-640",
+                         help="Helper COCO car-detector model ID on Roboflow (better at spotting cars from any angle). Use '' to disable.")
+    parser.add_argument("--car-conf", type=float, default=0.25, help="Confidence cutoff for the helper car model")
     parser.add_argument("--events-out", default="zone_events.jsonl")
     parser.add_argument("--no-display", action="store_true")
     parser.add_argument("--frame-skip", type=int, default=5,
@@ -247,6 +317,12 @@ def main():
     ).configure(InferenceConfiguration(api_key_transport="header"))
 
     zones = load_zones(args.zones)
+
+    if args.car_model:
+        car_model_state["enabled"] = True
+        car_model_state["model_id"] = args.car_model
+        print(f"[INFO] Helper car model enabled: {args.car_model} (conf {args.car_conf}); "
+              f"'free' cutoff {args.free_conf}, 'car' cutoff {args.conf}")
 
     source = int(args.source) if args.source.isdigit() else args.source
     cap = cv2.VideoCapture(source)
@@ -279,7 +355,7 @@ def main():
                 if zones:
                     detections = []
                     for zone in zones:
-                        detections.extend(detect_vehicles_in_zone(client, frame, zone, args.conf))
+                        detections.extend(detect_vehicles_in_zone(client, frame, zone, args))
                 else:
                     detections = detect_vehicles(client, frame, args.conf)
             except Exception as e:
@@ -353,8 +429,8 @@ def main():
                     scale = max_display_width / annotated.shape[1]
                     annotated = cv2.resize(annotated, None, fx=scale, fy=scale)
 
-                cv2.namedWindow("M-Smart Flow — Vehicle Detection", cv2.WINDOW_NORMAL)
-                cv2.imshow("M-Smart Flow — Vehicle Detection", annotated)
+                cv2.namedWindow("M-Smart Flow - Vehicle Detection", cv2.WINDOW_NORMAL)
+                cv2.imshow("M-Smart Flow - Vehicle Detection", annotated)
                 if cv2.waitKey(30) & 0xFF == ord("q"):
                     break
     finally:
