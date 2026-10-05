@@ -61,7 +61,9 @@ def load_zones(zones_path: str):
 
 def detect_vehicles(model: YOLO, frame, conf_threshold: float = 0.4):
     """Run YOLO26 inference and return a list of vehicle detections."""
-    results = model.predict(frame, conf=conf_threshold, verbose=False)[0]
+    # agnostic_nms: merge overlapping boxes across classes, so one vehicle
+    # labelled both "car" and "truck" doesn't get two boxes
+    results = model.predict(frame, conf=conf_threshold, agnostic_nms=True, verbose=False)[0]
     detections = []
     for box in results.boxes:
         cls_id = int(box.cls[0])
@@ -77,6 +79,44 @@ def detect_vehicles(model: YOLO, frame, conf_threshold: float = 0.4):
             "center": [cx, cy],
         })
     return detections
+
+
+def box_iou(a, b):
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / (area_a + area_b - inter + 1e-9)
+
+
+class DetectionSmoother:
+    """Reduce frame-to-frame flicker: a box missed for a few frames is kept
+    on screen (and in the count) instead of disappearing and reappearing.
+    Matching is by box overlap only — no vehicle IDs are assigned or stored."""
+
+    def __init__(self, hold_frames: int = 5, iou_match: float = 0.3, min_hits: int = 2):
+        self.hold_frames = hold_frames
+        self.iou_match = iou_match
+        self.min_hits = min_hits  # frames a new box must be seen before it is shown
+        self.kept = []  # [{"det": detection, "missed": frames_since_seen, "hits": frames_seen}]
+
+    def update(self, detections):
+        unmatched = list(detections)
+        for item in self.kept:
+            best = max(unmatched, key=lambda d: box_iou(d["box"], item["det"]["box"]), default=None)
+            if best is not None and box_iou(best["box"], item["det"]["box"]) >= self.iou_match:
+                item["det"], item["missed"] = best, 0
+                item["hits"] += 1
+                unmatched.remove(best)
+            else:
+                item["missed"] += 1
+        # confirmed boxes survive short misses; unconfirmed ones (one-frame
+        # false positives) are dropped as soon as they are missed
+        self.kept = [i for i in self.kept
+                     if i["missed"] <= (self.hold_frames if i["hits"] >= self.min_hits else 0)]
+        self.kept += [{"det": d, "missed": 0, "hits": 1} for d in unmatched]
+        return [i["det"] for i in self.kept if i["hits"] >= self.min_hits]
 
 
 def assign_to_zones(detections, zones):
@@ -102,7 +142,13 @@ def assign_to_zones(detections, zones):
     return snapshots
 
 
-def draw_overlay(frame, detections, zones, snapshots):
+def draw_overlay(frame, detections, zones, snapshots, display_width=700):
+    # The frame is shrunk to display_width before showing, so scale line and
+    # text sizes up front — a 1px line on a 1920px frame fades in and out
+    # (looks like blinking) once it is downscaled
+    s = max(frame.shape[1] / display_width, 1.0)
+    line, text_line, font = max(1, round(2 * s)), max(1, round(s)), 0.5 * s
+
     for zone, snap in zip(zones, snapshots):
         if snap["density_pct"] < 60:
             color = (0, 200, 0)
@@ -110,22 +156,26 @@ def draw_overlay(frame, detections, zones, snapshots):
             color = (0, 165, 255)
         else:
             color = (0, 0, 255)
-        cv2.polylines(frame, [zone.as_np()], isClosed=True, color=color, thickness=2)
+        cv2.polylines(frame, [zone.as_np()], isClosed=True, color=color, thickness=line)
         cv2.putText(frame, f"{zone.zone_id}: {snap['density_pct']}%", tuple(zone.polygon[0]),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, font * 1.2, color, text_line + 1)
 
     for det in detections:
         x1, y1, x2, y2 = det["box"]
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
-        cv2.putText(frame, f"{det['class']} {det['confidence']:.2f}", (x1, max(y1 - 6, 0)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), line)
+        # confidence shown to 1 decimal so the label doesn't flicker every frame
+        cv2.putText(frame, f"{det['class']} {det['confidence']:.1f}", (x1, max(y1 - int(6 * s), 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX, font, (0, 255, 0), text_line)
     return frame
 
 
 def main():
     parser = argparse.ArgumentParser(description="M-Smart Flow vehicle detection & zone occupancy")
     parser.add_argument("--source", default="0", help="Video file path, webcam index, or RTSP URL")
-    parser.add_argument("--zones", default="zones_example.json", help="Path to zone config JSON")
+    parser.add_argument("--zones", default=None,
+                        help="Path to zone config JSON (omit to show detections only, no zone overlay)")
+    parser.add_argument("--hold-frames", type=int, default=5,
+                        help="Keep a missed box for this many frames to reduce flicker (0 = off)")
     parser.add_argument("--model", default="yolo26n.pt", help="YOLO26 weights (nano recommended for edge/CPU)")
     parser.add_argument("--conf", type=float, default=0.4, help="Detection confidence threshold")
     parser.add_argument("--events-out", default="zone_events.jsonl", help="Path to write JSONL occupancy events")
@@ -135,7 +185,8 @@ def main():
     args = parser.parse_args()
 
     model = YOLO(args.model)  # auto-downloads weights on first run
-    zones = load_zones(args.zones)
+    zones = load_zones(args.zones) if args.zones else []
+    smoother = DetectionSmoother(args.hold_frames) if args.hold_frames > 0 else None
 
     source = int(args.source) if args.source.isdigit() else args.source
     cap = cv2.VideoCapture(source)
@@ -160,6 +211,8 @@ def main():
                 break
 
             detections = detect_vehicles(model, frame, args.conf)
+            if smoother:
+                detections = smoother.update(detections)
             snapshots = assign_to_zones(detections, zones)
 
             event = {

@@ -100,25 +100,104 @@ def detect_vehicles(client, frame, conf_threshold: float = 0.05):
 detect_vehicles._debug_printed = False
 
 
+def compute_zone_crop_box(zone, frame_shape,
+                           pad_top_ratio=2.0, pad_bottom_ratio=0.6,
+                           pad_side_ratio=0.25, min_pad_px=80):
+    """
+    The model performs much better on a tight crop around a single row of
+    cars than on the full wide-angle frame (confirmed via direct testing:
+    full-frame confidences topped out ~0.56 with almost nothing else
+    detected, while cropped-to-zone confidences reliably found multiple
+    cars at once). Zone polygons are traced near the floor/car-base, so we
+    pad generously upward to include car roofs, modestly downward/sideways
+    for context, and clamp to the frame bounds.
+    """
+    xs = [p[0] for p in zone.polygon]
+    ys = [p[1] for p in zone.polygon]
+    x1, x2 = min(xs), max(xs)
+    y1, y2 = min(ys), max(ys)
+    w, h = x2 - x1, y2 - y1
+
+    pad_top = max(int(h * pad_top_ratio), min_pad_px)
+    pad_bottom = max(int(h * pad_bottom_ratio), min_pad_px // 2)
+    pad_side = max(int(w * pad_side_ratio), min_pad_px)
+
+    frame_h, frame_w = frame_shape[:2]
+    cx1 = max(0, x1 - pad_side)
+    cy1 = max(0, y1 - pad_top)
+    cx2 = min(frame_w, x2 + pad_side)
+    cy2 = min(frame_h, y2 + pad_bottom)
+    return cx1, cy1, cx2, cy2
+
+
+def detect_vehicles_in_zone(client, frame, zone, conf_threshold):
+    """Crop to this zone's region (with padding), run detection on just the
+    crop, then offset the returned boxes/centers back into full-frame
+    coordinates so overlay drawing and zone point-in-polygon tests keep
+    working unchanged."""
+    cx1, cy1, cx2, cy2 = compute_zone_crop_box(zone, frame.shape)
+    crop = frame[cy1:cy2, cx1:cx2]
+    if crop.size == 0:
+        return []
+
+    detections = detect_vehicles(client, crop, conf_threshold)
+    for det in detections:
+        det["box"][0] += cx1
+        det["box"][1] += cy1
+        det["box"][2] += cx1
+        det["box"][3] += cy1
+        det["center"][0] += cx1
+        det["center"][1] += cy1
+    return detections
+
+
 def assign_to_zones(detections, zones):
-    zone_counts = {z.zone_id: 0 for z in zones}
+    """
+    The model classifies each detection as either "car" (an occupied space)
+    or "free" (an empty space) — these must be counted separately. Lumping
+    them together would count an empty spot as a parked vehicle and inflate
+    occupancy.
+    """
+    zone_cars = {z.zone_id: 0 for z in zones}
+    zone_free = {z.zone_id: 0 for z in zones}
+
     for det in detections:
         cx, cy = det["center"]
+        cls = det["class"]
         for zone in zones:
             if zone.contains_point(cx, cy):
-                zone_counts[zone.zone_id] += 1
+                if cls == "free":
+                    zone_free[zone.zone_id] += 1
+                else:
+                    # anything that isn't "free" is treated as an occupying vehicle
+                    # (covers "car" plus any other vehicle class the model might emit)
+                    zone_cars[zone.zone_id] += 1
                 break
+
     snapshots = []
     for zone in zones:
-        count = zone_counts[zone.zone_id]
-        density_pct = round(min(count / zone.capacity, 1.0) * 100, 1) if zone.capacity else 0.0
+        cars = zone_cars[zone.zone_id]
+        free = zone_free[zone.zone_id]
+        detected_spots = cars + free
+
+        # Prefer the model's own detected-spot count for density when it saw any
+        # spots at all; fall back to the configured capacity otherwise (e.g. the
+        # model missed some spots this frame, or zone is empty of detections).
+        denominator = detected_spots if detected_spots > 0 else zone.capacity
+        density_pct = round(min(cars / denominator, 1.0) * 100, 1) if denominator else 0.0
+
         snapshots.append({
             "zone_id": zone.zone_id,
-            "vehicle_count": count,
+            "vehicle_count": cars,
+            "free_count": free,
             "capacity": zone.capacity,
             "density_pct": density_pct,
         })
     return snapshots
+
+
+CAR_BOX_COLOR = (0, 0, 255)     # red — occupied
+FREE_BOX_COLOR = (0, 200, 0)    # green — empty spot
 
 
 def draw_overlay(frame, detections, zones, snapshots):
@@ -130,14 +209,17 @@ def draw_overlay(frame, detections, zones, snapshots):
         else:
             color = (0, 0, 255)
         cv2.polylines(frame, [zone.as_np()], isClosed=True, color=color, thickness=2)
-        cv2.putText(frame, f"{zone.zone_id}: {snap['density_pct']}%", tuple(zone.polygon[0]),
+        label = f"{zone.zone_id}: {snap['vehicle_count']} car / {snap['free_count']} free ({snap['density_pct']}%)"
+        cv2.putText(frame, label, tuple(zone.polygon[0]),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
     for det in detections:
         x1, y1, x2, y2 = det["box"]
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+        is_free = det["class"] == "free"
+        color = FREE_BOX_COLOR if is_free else CAR_BOX_COLOR
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
         cv2.putText(frame, f"{det['class']} {det['confidence']:.2f}", (x1, max(y1 - 8, 0)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     return frame
 
 
@@ -194,7 +276,12 @@ def main():
                 continue
 
             try:
-                detections = detect_vehicles(client, frame, args.conf)
+                if zones:
+                    detections = []
+                    for zone in zones:
+                        detections.extend(detect_vehicles_in_zone(client, frame, zone, args.conf))
+                else:
+                    detections = detect_vehicles(client, frame, args.conf)
             except Exception as e:
                 print(f"[ERROR] detection call failed: {type(e).__name__}: {e}")
                 # clear the frame so we don't just hammer the API with the same
@@ -211,14 +298,32 @@ def main():
                 state["snapshots"] = snapshots
                 state["frame_count"] += 1
 
+            # Raw totals: every detection the model returned, regardless of
+            # whether it falls inside a configured zone polygon. zones_example.json
+            # is still a placeholder (not calibrated to real camera footage), so
+            # the zone-scoped counts below can be 0 even when the model is finding
+            # plenty of cars elsewhere in frame — these raw totals are what
+            # actually reflect what the model sees.
+            raw_car_total = sum(1 for d in detections if d["class"] != "free")
+            raw_free_total = sum(1 for d in detections if d["class"] == "free")
+
+            # Zone-scoped totals: only detections that fall inside a zone polygon.
+            # Only meaningful once zones_example.json is calibrated to this camera.
+            zone_car_total = sum(s["vehicle_count"] for s in snapshots)
+            zone_free_total = sum(s["free_count"] for s in snapshots)
+
             event = {
                 "timestamp": time.time(),
-                "vehicle_total": len(detections),
+                "vehicle_total": raw_car_total,
+                "free_total": raw_free_total,
+                "zone_vehicle_total": zone_car_total,
+                "zone_free_total": zone_free_total,
                 "zones": snapshots,
             }
             events_file.write(json.dumps(event) + "\n")
             events_file.flush()
-            print(f"[detection {state['frame_count']}] {len(detections)} vehicles found")
+            print(f"[detection {state['frame_count']}] {raw_car_total} cars, {raw_free_total} free spots total "
+                  f"(in zones: {zone_car_total} cars, {zone_free_total} free)")
 
     worker_thread = threading.Thread(target=detection_worker, daemon=True)
     worker_thread.start()
