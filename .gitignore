@@ -1,11 +1,11 @@
-# Video footage — large, not source code, share via Drive/link instead
+# Video footage — large, not source code; share via Drive/link instead
 *.mov
 *.MOV
 *.mp4
 *.MP4
 *.avi
 
-# Model weights — too large for git, share separately (Drive, Roboflow link, etc.)
+# Model weights — too large for git; share separately (Drive, Roboflow link, etc.)
 *.pt
 *.onnx
 *.engine
