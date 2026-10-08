@@ -10,9 +10,17 @@ Install:
     pip install inference-sdk opencv-python numpy
 
 Usage:
-    set ROBOFLOW_API_KEY=your_key_here
+    set ROBOFLOW_API_KEY=UHKIluNzHGyjWsAMxoqk
     python vehicle_detection_api.py --source IMG_8838.MOV --zones zones_example.json
 """
+
+"python vehicle_detection_api.py --source IMG_8844.MOV --zones zones_8844.json --conf 0.05 --start-seconds 8 --infer-free"
+"python vehicle_detection_api.py --source IMG_8836.MOV --zones zones_8836.json --conf 0.05 --start-seconds 8 --spots --freeze"
+"python vehicle_detection_api.py --source IMG_8838.MOV --zones zones_8838.json --conf 0.05 --start-seconds 8 --spots --freeze"
+"python vehicle_detection_api.py --source IMG_8843.MOV --zones zones_8843.json --conf 0.05 --start-seconds 8 --spots --freeze"
+"python vehicle_detection_api.py --source IMG_8845.MOV --zones zones_8845.json --conf 0.05 --start-seconds 8 --spots --freeze"
+"python vehicle_detection_api.py --source IMG_8847.MOV --zones zones_8847.json --conf 0.05 --start-seconds 8 --spots --freeze"
+
 
 import argparse
 import json
