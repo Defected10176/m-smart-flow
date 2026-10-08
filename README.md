@@ -2,7 +2,7 @@
 
 AI-powered smart parking system for the MUICT & The Mall Hackathon 2026 — built by team **Cboog**.
 
-Helps drivers find parking faster via CCTV-based vehicle/zone detection, and rewards
+Helps drivers find parking faster via CCTV-based vehicle/zone detection and rewards
 faster turnover through an Exit Delay Promotion engine and Eco-Rewards (ESG / CO2
 savings) gamification layer.
 
@@ -47,7 +47,7 @@ savings) gamification layer.
    ```
    set ROBOFLOW_API_KEY=your_key_here
    ```
-   PowerShell: `$env:ROBOFLOW_API_KEY="your_key_here"`. Or pass `--api-key your_key_here` per run.
+   PowerShell: `$env: ROBOFLOW_API_KEY="your_key_here"`. Or pass `--api-key your_key_here` per run.
 5. **Get the video files from the repo owner** (Drive/USB). Videos are not in git because
    they are too large. Put `IMG_8838.MOV` in the repo folder.
 
@@ -57,7 +57,7 @@ savings) gamification layer.
 python vehicle_detection_api.py --source IMG_8838.MOV --zones zones_calibrated.json --conf 0.05 --start-seconds 8
 ```
 
-A window opens with the video. Zone outlines show `N car / M free (X%)`. Boxes are red for
+A window opens with the video. Zone outlines show `N cars / M free (X%)`. Boxes are red for
 cars and green for free spots. Press `q` to quit. Each processed frame also prints a line:
 
 ```
