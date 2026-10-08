@@ -30,7 +30,7 @@ savings) gamification layer.
 | `train_yolo_parking.py` | Local training script. Not used in the final workflow (we trained via Roboflow web UI). |
 | `requirements.txt` | Python dependencies. |
 
-## Setup (teammates start here)
+## Setup 
 
 1. Clone the repo (or `git pull` if you already have it) and enter the folder.
 2. Create a virtual environment and install dependencies:
