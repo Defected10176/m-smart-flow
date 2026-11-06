@@ -42,3 +42,18 @@ env/
 .DS_Store
 .vscode/
 .idea/
+
+# datasets and labeling work (large, regenerable)
+*.zip
+Parking Lot*/
+LPR plate*/
+dataset_additions*/
+final_dataset/
+holdout_*/
+labeling_*/
+diagnose_out/
+local_test_out/
+plate_test_out/
+jpg_files/
+*.bak
+*.bak_*
